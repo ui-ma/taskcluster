@@ -33,6 +33,7 @@ _testmain.go
 
 *.exe
 *.test
+!Dockerfile.test
 *.prof
 
 # Coverage report
