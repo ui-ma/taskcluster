@@ -49,8 +49,11 @@ func OnTerminationRequest(id string, f GracefulTerminationFunc) func() {
 	}
 }
 
-// A graceful termination has been requested. Set a flag so that no further
-// tasks are claimed, and call all registered callbacks.
+// Terminate signals that a graceful termination has been requested. It sets a
+// flag so that no further tasks are claimed, and fires all registered callbacks
+// in separate goroutines (fire-and-forget). Terminate returns before callbacks
+// execute; callers that need to wait for completion should use an external
+// synchronization mechanism (e.g. WaitGroup).
 // If finishTasks is true, tasks should be allowed to complete.
 // If finishTasks is false, tasks should be aborted immediately.
 func Terminate(finishTasks bool) {

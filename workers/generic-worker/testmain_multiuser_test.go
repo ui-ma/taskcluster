@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 )
@@ -21,18 +20,25 @@ func TestMain(m *testing.M) {
 		os.Exit(m.Run())
 	}
 
-	// next-task-user.json exists — can run natively (CI or local Linux with setup)
+	// next-task-user.json exists — can run natively (CI or production setup)
 	if _, err := os.Stat(filepath.Join(cwd, "next-task-user.json")); err == nil {
 		os.Exit(m.Run())
 	}
 
-	// Only route to Docker on Linux (macOS/Windows multiuser tests run natively)
-	if runtime.GOOS != "linux" {
-		os.Exit(m.Run())
+	// No native setup — route to Docker if available
+	if !dockerAvailable() {
+		fmt.Fprintln(os.Stderr, "Multiuser tests require either Docker or a pre-configured next-task-user.json.")
+		fmt.Fprintln(os.Stderr, "These tests create OS user accounts and are not meant to run directly on your machine.")
+		fmt.Fprintln(os.Stderr, "Ensure Docker is running before running them locally.")
+		os.Exit(1)
 	}
 
-	// Linux + no next-task-user.json + not in Docker — route to Docker
 	os.Exit(runInDocker())
+}
+
+// dockerAvailable checks whether Docker is installed and the daemon is running.
+func dockerAvailable() bool {
+	return exec.Command("docker", "info").Run() == nil
 }
 
 // repoRoot walks up from cwd to find the directory containing go.mod.
@@ -59,10 +65,13 @@ func ensureDockerImage() error {
 
 	fmt.Fprintf(os.Stderr, "Building Docker image %s...\n", dockerImage)
 	dockerfilePath := filepath.Join(cwd, "Dockerfile.test")
-	build := exec.Command("docker", "build", "-f", dockerfilePath, "-t", dockerImage, cwd)
-	build.Stdout = os.Stdout
-	build.Stderr = os.Stderr
-	return build.Run()
+	build := exec.Command("docker", "build", "--quiet", "-f", dockerfilePath, "-t", dockerImage, cwd)
+	out, err := build.CombinedOutput()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s", out)
+		return err
+	}
+	return nil
 }
 
 // translateTestFlags converts -test.* flags from os.Args into go test flags.
@@ -102,15 +111,29 @@ func runInDocker() int {
 		return 1
 	}
 
+	gitRev, err := exec.Command("git", "rev-parse", "HEAD").Output()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error getting git revision: %v\n", err)
+		return 1
+	}
+	rev := strings.TrimSpace(string(gitRev))
+	modPath, err := exec.Command("go", "list", "-m").Output()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error getting module path: %v\n", err)
+		return 1
+	}
+	ldflags := fmt.Sprintf(`-ldflags=-X %s/workers/generic-worker.revision=%s`, strings.TrimSpace(string(modPath)), rev)
+
 	testFlags := translateTestFlags()
 	parts := []string{
+		"git config --global --add safe.directory /src &&",
 		"go install ../../tools/livelog &&",
 		"go install ../../tools/taskcluster-proxy &&",
 		"go install -tags multiuser ./... &&",
-		"go test -tags multiuser",
+		fmt.Sprintf("go test -tags multiuser %q", ldflags),
 	}
 	parts = append(parts, testFlags...)
-	parts = append(parts, "./...")
+	parts = append(parts, ".")
 	innerCmd := strings.Join(parts, " ")
 
 	fmt.Fprintf(os.Stderr, "Running multiuser tests in Docker...\n")

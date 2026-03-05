@@ -26,6 +26,9 @@ func TestExitCodeMissingChainOfTrustKey(t *testing.T) {
 }
 
 func TestChainOfTrustUpload(t *testing.T) {
+	if os.Getenv("GW_IN_DOCKER") == "1" {
+		t.Skip("Skipping in Docker: CoT key permission isolation requires a non-root environment")
+	}
 
 	setup(t)
 
@@ -267,6 +270,9 @@ func TestChainOfTrustUploadAsCurrentUser(t *testing.T) {
 }
 
 func TestProtectedArtifactsReplaced(t *testing.T) {
+	if os.Getenv("GW_IN_DOCKER") == "1" {
+		t.Skip("Skipping in Docker: CoT key permission isolation requires a non-root environment")
+	}
 
 	setup(t)
 
@@ -444,6 +450,9 @@ func TestProtectedArtifactsReplacedAsCurrentUser(t *testing.T) {
 }
 
 func TestChainOfTrustAdditionalData(t *testing.T) {
+	if os.Getenv("GW_IN_DOCKER") == "1" {
+		t.Skip("Skipping in Docker: CoT key permission isolation requires a non-root environment")
+	}
 
 	setup(t)
 

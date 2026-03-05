@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -41,6 +42,17 @@ var (
 	testdataDir    = filepath.Join(cwd, "testdata")
 	cachesDir      = filepath.Join(cwd, "caches")
 )
+
+// skipInDockerIfNoDocker skips the test when running inside the GW test
+// Docker container and Docker is not available (no Docker-in-Docker).
+func skipInDockerIfNoDocker(t *testing.T) {
+	t.Helper()
+	if os.Getenv("GW_IN_DOCKER") == "1" {
+		if err := exec.Command("docker", "info").Run(); err != nil {
+			t.Skip("Skipping in Docker: test requires Docker-in-Docker which is not available")
+		}
+	}
+}
 
 func setup(t *testing.T) {
 	t.Helper()

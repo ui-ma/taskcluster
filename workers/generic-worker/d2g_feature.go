@@ -19,6 +19,12 @@ import (
 	"github.com/taskcluster/taskcluster/v99/workers/generic-worker/process"
 )
 
+// Lock ordering (to prevent deadlocks):
+//  1. d2gImageLoadMutex (outermost — serializes docker load/pull)
+//  2. d2gCacheMutex     (protects d2g-image-cache.json)
+//  3. cacheMutex        (innermost — protects file/directory cache maps,
+//     defined in mounts_feature.go; acquired by garbageCollection which
+//     calls removeD2GCacheFile → d2gCacheMutex)
 var (
 	// d2gCacheMutex protects access to the d2g-image-cache.json file
 	// for concurrent task execution (capacity > 1)
@@ -198,31 +204,11 @@ func (dtf *D2GTaskFeature) Start() *CommandExecutionError {
 	// (see https://github.com/taskcluster/taskcluster/issues/8004)
 	if isImageArtifact {
 		if image == nil {
-			// Docker image artifacts frequently reuse tags. Serialize loads so that
-			// tag -> ID resolution isn't raced by another load.
-			d2gImageLoadMutex.Lock()
-
-			// Refresh cache from disk in case another task loaded this image
-			// while we were waiting to acquire the lock.
-			latestCache := ImageCache{}
-			d2gCacheMutex.Lock()
-			latestCache.loadFromFile("d2g-image-cache.json")
-			d2gCacheMutex.Unlock()
-			maps.Copy(dtf.imageCache, latestCache)
-			image = latestCache[key]
-
-			if image == nil {
-				var loadErr *CommandExecutionError
-				image, loadErr = loadImage()
-				if loadErr != nil {
-					d2gImageLoadMutex.Unlock()
-					return loadErr
-				}
-				dtf.imageCache[key] = image
-				loadedImage = true
+			var loadErr *CommandExecutionError
+			image, loadedImage, loadErr = dtf.loadImageArtifactLocked(key, loadImage)
+			if loadErr != nil {
+				return loadErr
 			}
-
-			d2gImageLoadMutex.Unlock()
 		}
 	} else {
 		var loadErr *CommandExecutionError
@@ -302,6 +288,31 @@ func (dtf *D2GTaskFeature) Start() *CommandExecutionError {
 	d2gCacheMutex.Unlock()
 
 	return nil
+}
+
+// loadImageArtifactLocked serializes docker image artifact loads so that
+// concurrent tasks don't race on tag -> ID resolution.
+func (dtf *D2GTaskFeature) loadImageArtifactLocked(key string, loadImage func() (*Image, *CommandExecutionError)) (*Image, bool, *CommandExecutionError) {
+	d2gImageLoadMutex.Lock()
+	defer d2gImageLoadMutex.Unlock()
+
+	// Refresh cache from disk in case another task loaded this image
+	// while we were waiting to acquire the lock.
+	latestCache := ImageCache{}
+	d2gCacheMutex.Lock()
+	latestCache.loadFromFile("d2g-image-cache.json")
+	d2gCacheMutex.Unlock()
+	maps.Copy(dtf.imageCache, latestCache)
+	if image := latestCache[key]; image != nil {
+		return image, false, nil
+	}
+
+	image, loadErr := loadImage()
+	if loadErr != nil {
+		return nil, false, loadErr
+	}
+	dtf.imageCache[key] = image
+	return image, true, nil
 }
 
 func (dtf *D2GTaskFeature) Stop(err *ExecutionErrors) {

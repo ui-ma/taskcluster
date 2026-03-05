@@ -509,7 +509,8 @@ mainLoop:
 				lastActive = time.Now()
 
 				if result.workerShutdown {
-					log.Printf("Task %s requested worker shutdown, waiting for other tasks...", result.taskID)
+					log.Printf("Task %s requested worker shutdown, aborting other tasks...", result.taskID)
+					graceful.Terminate(false) // Abort other tasks immediately
 					taskManager.WaitForAll()
 					return WORKER_SHUTDOWN
 				}
@@ -550,8 +551,10 @@ mainLoop:
 			return WORKER_MANAGER_SHUTDOWN
 		}
 
-		// Ensure there is enough disk space *before* claiming a task
-		err := garbageCollection()
+		// Ensure there is enough disk space *before* claiming a task.
+		// Pass tasksRunning so docker prune is skipped when tasks may
+		// have loaded images that are not yet running in a container.
+		err := garbageCollection(!taskManager.IsIdle())
 		if err != nil {
 			panic(err)
 		}
@@ -587,16 +590,21 @@ mainLoop:
 			for _, task := range tasks {
 				// Create per-task context
 				// Include runId to avoid collisions when tasks are rerun (same taskId, new runId)
-				// Format: task_<12 chars of taskId>_<runId> (max 20 chars for Windows username limit)
+				// Format: task_<taskIdPart>_<runId> (max 20 chars for Windows username limit)
+				// Dynamically size taskIdPart based on runId length to guarantee <= 20 chars
+				runIDStr := fmt.Sprintf("%d", task.RunID)
+				maxTaskIDLen := 20 - len("task_") - len("_") - len(runIDStr)
 				taskIDPart := task.TaskID
-				if len(taskIDPart) > 12 {
-					taskIDPart = taskIDPart[:12]
+				if len(taskIDPart) > maxTaskIDLen {
+					taskIDPart = taskIDPart[:maxTaskIDLen]
 				}
-				taskDirName := fmt.Sprintf("task_%s_%d", taskIDPart, task.RunID)
+				taskDirName := fmt.Sprintf("task_%s_%s", taskIDPart, runIDStr)
 				ctx := CreateTaskContext(taskDirName)
 				task.Context = ctx
-				if runningTests {
-					// Update global taskContext for test compatibility (tests read logs via LogText)
+				if runningTests && config.Capacity == 1 {
+					// Update global taskContext for test compatibility (tests read logs via LogText).
+					// Only safe when capacity=1; with capacity>1 concurrent goroutines
+					// would race on this global.
 					taskContext = ctx
 				}
 
@@ -608,12 +616,28 @@ mainLoop:
 				}
 				log.Printf("Created dir: %v", gwDir)
 
+				// cleanupTaskSetup removes the task directory and releases
+				// platform resources on early error paths before the task
+				// goroutine is launched.
+				cleanupTaskSetup := func(pd *process.PlatformData) {
+					if pd != nil {
+						if releaseErr := pd.ReleaseResources(); releaseErr != nil {
+							log.Printf("ERROR releasing platform resources for task %s: %v", task.TaskID, releaseErr)
+						}
+					}
+					if removeErr := os.RemoveAll(ctx.TaskDir); removeErr != nil {
+						log.Printf("ERROR removing task directory %s: %v", ctx.TaskDir, removeErr)
+					}
+				}
+
 				// Get platform data for this task's context
 				pd, err := platformDataForTaskContext(ctx)
 				if err != nil {
 					log.Printf("ERROR getting platform data for %s: %v", task.TaskID, err)
 					_ = task.StatusManager.ReportException(internalError)
-					return INTERNAL_ERROR
+					cleanupTaskSetup(nil)
+					taskCompleteChan <- taskCompletionResult{taskID: task.TaskID}
+					continue
 				}
 				task.pd = pd
 
@@ -621,7 +645,9 @@ mainLoop:
 				if err != nil {
 					log.Printf("Invalid generic-worker binary for task %s: %v", task.TaskID, err)
 					_ = task.StatusManager.ReportException(internalError)
-					return INTERNAL_ERROR
+					cleanupTaskSetup(pd)
+					taskCompleteChan <- taskCompletionResult{taskID: task.TaskID}
+					continue
 				}
 
 				// Allocate ports for this task
@@ -629,12 +655,14 @@ mainLoop:
 				if err != nil {
 					log.Printf("ERROR allocating ports for task %s: %v", task.TaskID, err)
 					_ = task.StatusManager.ReportException(internalError)
-					return INTERNAL_ERROR
+					cleanupTaskSetup(pd)
+					taskCompleteChan <- taskCompletionResult{taskID: task.TaskID}
+					continue
 				}
 				task.AllocatedPorts = allocatedPorts
-				log.Printf("Task %s allocated ports: LiveLog=%d/%d, Interactive=%d, TaskclusterProxy=%d",
+				log.Printf("Task %s allocated ports: LiveLog(PUT/GET)=%d/%d, Interactive=%d, TaskclusterProxy=%d",
 					task.TaskID,
-					allocatedPorts[PortIndexLiveLogGET], allocatedPorts[PortIndexLiveLogPUT],
+					allocatedPorts[PortIndexLiveLogPUT], allocatedPorts[PortIndexLiveLogGET],
 					allocatedPorts[PortIndexInteractive], allocatedPorts[PortIndexTaskclusterProxy])
 
 				logEvent("taskQueued", task, time.Time(task.Definition.Created))
@@ -645,6 +673,10 @@ mainLoop:
 				go func(t *TaskRun) {
 					var errors *ExecutionErrors
 					defer func() {
+						if r := recover(); r != nil {
+							log.Printf("PANIC in task %s goroutine: %v", t.TaskID, r)
+							t.Error(fmt.Sprintf("Internal worker error (panic): %v", r))
+						}
 						taskManager.RemoveTask(t.TaskID)
 						portManager.ReleasePorts(t.TaskID)
 						workerShutdown := errors != nil && errors.WorkerShutdown()
@@ -721,7 +753,8 @@ mainLoop:
 			taskCompleteChan <- result
 			continue mainLoop
 		case <-sigInterrupt:
-			log.Printf("Interrupt received, waiting for %d running tasks...", taskManager.TaskCount())
+			log.Printf("Interrupt received, signaling %d running tasks...", taskManager.TaskCount())
+			graceful.Terminate(true)
 			taskManager.WaitForAll()
 			return WORKER_STOPPED
 		}
@@ -1094,6 +1127,14 @@ func (task *TaskRun) Run() (err *ExecutionErrors) {
 	for _, feature := range features {
 		if feature.IsRequested(task) {
 			if !feature.IsEnabled() {
+				// Check if the feature provides a specific reason for being disabled
+				// (e.g. incompatible with capacity > 1)
+				if drp, ok := feature.(DisabledReasonProvider); ok {
+					if reason := drp.DisabledReason(); reason != "" {
+						err.add(MalformedPayloadError(fmt.Errorf("%s", reason)))
+						return
+					}
+				}
 				workerPoolID := config.ProvisionerID + "/" + config.WorkerType
 				workerManagerURL := config.RootURL + "/worker-manager/" + url.PathEscape(workerPoolID)
 				err.add(MalformedPayloadError(fmt.Errorf(`this task is attempting to use feature %q, but it's not enabled on this worker pool (%s)

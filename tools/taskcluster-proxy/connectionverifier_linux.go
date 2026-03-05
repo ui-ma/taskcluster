@@ -61,6 +61,11 @@ func (v *linuxVerifier) Verify(conn net.Conn) error {
 
 // lookupUIDFromProcNet reads /proc/net/tcp (or tcp6) to find the UID
 // owning the given source address/port.
+//
+// Limitation: only works when proxy and task share the same network
+// namespace. Connections from a separate namespace (e.g. a container
+// with its own netns) will not appear in /proc/net/tcp and
+// verification will fail (fail-closed).
 func lookupUIDFromProcNet(addr *net.TCPAddr) (uint32, error) {
 	procFile := "/proc/net/tcp"
 	if addr.IP.To4() == nil {

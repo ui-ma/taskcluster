@@ -28,8 +28,12 @@ const (
 var runningTests bool = false
 
 // validateEngineConfig validates engine-specific configuration.
-// For insecure engine, capacity > 1 is always allowed.
 func validateEngineConfig() error {
+	if config.Capacity > 1 {
+		log.Printf("WARNING: insecure engine with capacity=%d provides "+
+			"NO credential or file system isolation between concurrent tasks. "+
+			"Use multiuser engine for production workloads.", config.Capacity)
+	}
 	return nil
 }
 

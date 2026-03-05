@@ -53,6 +53,8 @@ func (r *Result) Crashed() bool {
 	return false
 }
 
+// SetEnv sets an environment variable for the process, replacing any
+// existing entry with the same name.
 func (c *Command) SetEnv(envVar, value string) {
 	prefix := envVar + "="
 	for i, e := range c.Env {

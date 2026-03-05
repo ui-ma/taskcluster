@@ -13,6 +13,7 @@ import (
 )
 
 func TestD2GWithChainOfTrust(t *testing.T) {
+	skipInDockerIfNoDocker(t)
 	setup(t)
 	payload := dockerworker.DockerWorkerPayload{
 		Command: []string{"/bin/bash", "-c", "echo hello"},

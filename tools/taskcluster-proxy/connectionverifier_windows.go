@@ -87,6 +87,11 @@ const (
 	afInet                      = 2
 )
 
+// lookupPIDFromTcpTable finds the PID owning the local TCP endpoint at addr.
+// Only IPv4 is supported via MIB_TCPTABLE_OWNER_PID (AF_INET). Pure IPv6
+// and IPv4-mapped-IPv6 addresses (e.g. ::ffff:127.0.0.1) are rejected
+// fail-closed. A follow-up may add MIB_TCP6TABLE_OWNER_PID support if
+// Windows workers need IPv6 loopback.
 func lookupPIDFromTcpTable(addr *net.TCPAddr) (uint32, error) {
 	ip4 := addr.IP.To4()
 	if ip4 == nil {
@@ -142,5 +147,8 @@ func getProcessUserSID(pid uint32) (*windows.SID, error) {
 		return nil, fmt.Errorf("GetTokenUser: %w", err)
 	}
 
-	return (*windows.SID)(unsafe.Pointer(tokenUser.User.Sid)), nil
+	// Copy the SID so the returned pointer doesn't alias the tokenUser
+	// buffer, which may be garbage-collected after this function returns.
+	sid := (*windows.SID)(unsafe.Pointer(tokenUser.User.Sid))
+	return sid.Copy()
 }

@@ -24,6 +24,7 @@ import (
 	"github.com/taskcluster/taskcluster/v99/internal/mocktc/tc"
 	"github.com/taskcluster/taskcluster/v99/internal/scopes"
 	"github.com/taskcluster/taskcluster/v99/workers/generic-worker/fileutil"
+	"golang.org/x/sync/singleflight"
 )
 
 var (
@@ -32,7 +33,7 @@ var (
 	// downloaded from. The map values are the paths of the downloaded files
 	// relative to the downloads directory specified in the global config file
 	// on the worker.
-	fileCaches CacheMap
+	fileCaches FileCacheMap
 	// writable directory caches that may be preloaded or initially empty. Note
 	// a preloaded cache will have an associated file cache for the archive it
 	// was created from. The key is the cache name.
@@ -42,25 +43,130 @@ var (
 	lastQueriedPurgeCacheService time.Time
 	// cacheMutex protects access to fileCaches, directoryCaches, and
 	// lastQueriedPurgeCacheService for concurrent task execution (capacity > 1)
-	cacheMutex sync.RWMutex
+	cacheMutex sync.Mutex
 
-	// cacheRWLocks provides per-cache RWMutex locks. Mount takes an RLock
-	// while copying from the authoritative cache dir (concurrent reads OK).
-	// Unmount takes a write Lock while swapping the cache dir contents
-	// (exclusive with reads and other writes).
-	cacheRWMu    sync.Mutex
-	cacheRWLocks = map[string]*sync.RWMutex{}
+	// fileCacheDownloads deduplicates concurrent downloads for the same cache key.
+	fileCacheDownloads singleflight.Group
 )
 
 type (
-	CacheMap map[string]*Cache
+	CacheMap     map[string][]*Cache
+	FileCacheMap map[string]*Cache
 )
 
-type cacheMountState struct {
-	baseGeneration uint64
+// CacheOwner allows a Cache to remove itself from its owning map during eviction.
+type CacheOwner interface {
+	Remove(entry *Cache)
 }
 
 func (cm CacheMap) SortedResources() Resources {
+	r := Resources{}
+	for _, entries := range cm {
+		for _, cache := range entries {
+			if !cache.InUse {
+				r = append(r, cache)
+			}
+		}
+	}
+	sort.Sort(r)
+	return r
+}
+
+func (cm CacheMap) Remove(entry *Cache) {
+	entries := cm[entry.Key]
+	for i, e := range entries {
+		if e == entry {
+			cm[entry.Key] = append(entries[:i], entries[i+1:]...)
+			break
+		}
+	}
+	if len(cm[entry.Key]) == 0 {
+		delete(cm, entry.Key)
+	}
+}
+
+// AcquireCache finds an available (not in-use) pool entry for the given cache
+// name, marks it InUse, and returns it. Returns nil if no entry is available.
+// Caller must hold cacheMutex.
+func AcquireCache(name string) *Cache {
+	entries := directoryCaches[name]
+	var best *Cache
+	for _, e := range entries {
+		if !e.InUse {
+			if best == nil || e.LastUsed.After(best.LastUsed) {
+				best = e
+			}
+		}
+	}
+	if best != nil {
+		best.InUse = true
+		best.Hits++
+	}
+	return best
+}
+
+// ReleaseCache marks a pool entry as available and records the current time.
+// If a purge was requested while the entry was in use, the entry is evicted
+// instead of being returned to the pool.
+// Caller must hold cacheMutex.
+func ReleaseCache(entry *Cache) {
+	if entry.NeedsPurge {
+		log.Printf("Evicting cache %v that was marked for purge while in use", entry.Key)
+		_ = entry.Evict(nil)
+		return
+	}
+	entry.InUse = false
+	entry.LastUsed = time.Now()
+}
+
+// newPoolEntry creates a new in-use cache pool entry for the given cache name.
+// Caller must hold cacheMutex.
+func newPoolEntry(cacheName string) (*Cache, error) {
+	basename := slugid.Nice()
+	file := filepath.Join(config.CachesDir, basename)
+	currentUser, err := user.Current()
+	if err != nil {
+		return nil, fmt.Errorf("[mounts] not able to look up UID for current user: %w", err)
+	}
+	return &Cache{
+		Hits:          1,
+		Created:       time.Now(),
+		Location:      file,
+		Owner:         directoryCaches,
+		Key:           cacheName,
+		OwnerUsername: currentUser.Username,
+		OwnerUID:      currentUser.Uid,
+		InUse:         true,
+	}, nil
+}
+
+// trimPoolExcess evicts available entries beyond config.Capacity per cache name.
+// Caller must hold cacheMutex.
+func trimPoolExcess() {
+	for name, entries := range directoryCaches {
+		available := []*Cache{}
+		for _, e := range entries {
+			if !e.InUse {
+				available = append(available, e)
+			}
+		}
+		excess := len(available) - int(config.Capacity)
+		if excess <= 0 {
+			continue
+		}
+		sort.Slice(available, func(i, j int) bool {
+			return available[i].LastUsed.Before(available[j].LastUsed)
+		})
+		for i := range excess {
+			_ = available[i].Evict(nil)
+		}
+		if len(directoryCaches[name]) == 0 {
+			delete(directoryCaches, name)
+		}
+	}
+}
+
+func (cm FileCacheMap) SortedResources() Resources {
 	r := make(Resources, len(cm))
 	i := 0
 	for _, cache := range cm {
@@ -71,16 +177,35 @@ func (cm CacheMap) SortedResources() Resources {
 	return r
 }
 
-// getCacheRWLock returns the per-cache RWMutex, creating one if needed.
-func getCacheRWLock(cacheName string) *sync.RWMutex {
-	cacheRWMu.Lock()
-	defer cacheRWMu.Unlock()
-	rw := cacheRWLocks[cacheName]
-	if rw == nil {
-		rw = &sync.RWMutex{}
-		cacheRWLocks[cacheName] = rw
+func (cm FileCacheMap) Remove(entry *Cache) {
+	delete(cm, entry.Key)
+}
+
+func (cm *FileCacheMap) LoadFromFile(stateFile string, cacheDir string) {
+	_, err := os.Stat(stateFile)
+	if err != nil {
+		log.Printf("No %v file found, creating empty FileCacheMap", stateFile)
+		*cm = FileCacheMap{}
+		perms := os.FileMode(0700)
+		log.Printf("[mounts] Creating worker cache directory %v with permissions 0%o", cacheDir, perms)
+		err := os.MkdirAll(cacheDir, perms)
+		if err != nil {
+			panic(fmt.Errorf("[mounts] Not able to create worker cache directory %v with permissions 0%o: %v", cacheDir, perms, err))
+		}
+		return
 	}
-	return rw
+	err = loadFromJSONFile(cm, stateFile)
+	if err != nil {
+		panic(err)
+	}
+	for i := range *cm {
+		if _, err = os.Stat((*cm)[i].Location); err != nil {
+			log.Printf("WARNING: Cache %#v missing on worker - corrupt internal state, ignoring!", (*cm)[i])
+			delete(*cm, i)
+		} else {
+			(*cm)[i].Owner = *cm
+		}
+	}
 }
 
 type Cache struct {
@@ -90,13 +215,10 @@ type Cache struct {
 	// the number of times this cache has been included in a MountEntry on a
 	// task run on this worker
 	Hits int `json:"hits"`
-	// Generation increments whenever a task successfully promotes its cache
-	// contents back to the authoritative cache location.
-	Generation uint64 `json:"generation,omitempty"`
 	// The map that tracks the cache, needed for expunging the cache
 	// Don't store in json, otherwise we'll have circular structure and create
 	// an infinite file!
-	Owner CacheMap `json:"-"`
+	Owner CacheOwner `json:"-"`
 	// The key used in the CacheMap
 	Key string `json:"key"`
 	// SHA256 of content, if a file (not used for directories)
@@ -115,22 +237,32 @@ type Cache struct {
 	// Since: generic-worker 75.0.0
 	OwnerUsername string `json:"ownerUsername"`
 	OwnerUID      string `json:"mounterUID"`
+	// InUse indicates whether a task currently owns this pool entry.
+	InUse bool `json:"in_use"`
+	// LastUsed records when this entry was last returned to the pool.
+	LastUsed time.Time `json:"last_used"`
+	// NeedsPurge is set when a purge request arrives while the entry is
+	// in use. ReleaseCache checks this flag and evicts the entry instead
+	// of returning it to the pool.
+	NeedsPurge bool `json:"-"`
 }
 
-// Rating determines how valuable the file cache is compared to other file
-// caches. We will base this entirely on how many times it was used before.
-// The more times it was referenced in a task that already ran on this
-// worker, the higher the rating will be. For now we'll disregard disk
-// space taken up.
+// Rating determines how valuable the cache is compared to others.
+// Older entries get lower ratings and are evicted first by GC.
 func (cache *Cache) Rating() float64 {
-	return float64(cache.Hits)
+	if cache.LastUsed.IsZero() {
+		return 0
+	}
+	return float64(cache.LastUsed.Unix())
 }
 
 func (cache *Cache) Evict(taskMount *TaskMount) error {
 	if taskMount != nil {
 		taskMount.Infof("Removing cache %v from cache table", cache.Key)
 	}
-	delete(cache.Owner, cache.Key)
+	if cache.Owner != nil {
+		cache.Owner.Remove(cache)
+	}
 	if taskMount != nil {
 		taskMount.Infof("Deleting cache %v file(s) at %v", cache.Key, cache.Location)
 	}
@@ -192,26 +324,37 @@ func (cm *CacheMap) LoadFromFile(stateFile string, cacheDir string) {
 		}
 		return
 	}
+
+	// Try new pool format (map[string][]*Cache) first
 	err = loadFromJSONFile(cm, stateFile)
 	if err != nil {
-		panic(err)
+		// Try old format (map[string]*Cache) for migration from pre-pool versions
+		var old map[string]*Cache
+		if oldErr := loadFromJSONFile(&old, stateFile); oldErr != nil {
+			panic(oldErr)
+		}
+		*cm = CacheMap{}
+		for k, v := range old {
+			(*cm)[k] = []*Cache{v}
+		}
 	}
-	for i := range *cm {
-		// Github Issues: #5363, #5396
-		// Bugzilla Bug: https://bugzilla.mozilla.org/show_bug.cgi?id=1595217
-		// Loop through cache entries, and remove any that refer to files/dirs that do not exist.
-		// Log a warning in worker log, and don't raise an exception.
-		if _, err = os.Stat((*cm)[i].Location); err != nil {
-			log.Printf("WARNING: Cache %#v missing on worker - corrupt internal state, ignoring!", (*cm)[i])
-			// note, this should be safe, despite looking scary:
-			// https://stackoverflow.com/questions/23229975/is-it-safe-to-remove-selected-keys-from-map-within-a-range-loop
-			delete(*cm, i)
-		} else {
-			(*cm)[i].Owner = *cm
-			// Treat pre-existing caches as initialized to avoid re-applying content.
-			if (*cm)[i].Generation == 0 {
-				(*cm)[i].Generation = 1
+
+	// Validate entries, remove missing directories, set Owner, reset InUse
+	for name, entries := range *cm {
+		valid := entries[:0]
+		for _, cache := range entries {
+			if _, statErr := os.Stat(cache.Location); statErr != nil {
+				log.Printf("WARNING: Cache %#v missing on worker - corrupt internal state, ignoring!", cache)
+				continue
 			}
+			cache.Owner = *cm
+			cache.InUse = false // all entries are available on startup
+			valid = append(valid, cache)
+		}
+		if len(valid) == 0 {
+			delete(*cm, name)
+		} else {
+			(*cm)[name] = valid
 		}
 	}
 }
@@ -235,7 +378,9 @@ type TaskMount struct {
 	requiredScopes    scopes.Required
 	referencedTaskIDs map[string]bool // simple implementation of set of strings
 	index             tc.Index
-	cacheStates       map[*WritableDirectoryCache]cacheMountState
+	// poolEntries tracks which pool entry each WritableDirectoryCache acquired
+	// during Mount, so Unmount can release it back.
+	poolEntries map[*WritableDirectoryCache]*Cache
 }
 
 // Represents an individual Mount listed in task payload - there
@@ -311,7 +456,7 @@ func (feature *MountsFeature) NewTaskFeature(task *TaskRun) TaskFeature {
 		task:        task,
 		mounts:      []MountEntry{},
 		mounted:     []MountEntry{},
-		cacheStates: make(map[*WritableDirectoryCache]cacheMountState),
+		poolEntries: make(map[*WritableDirectoryCache]*Cache),
 	}
 	for i, taskMount := range task.Payload.Mounts {
 		// Each mount must be one of:
@@ -425,14 +570,52 @@ func (taskMount *TaskMount) initIndexClient() {
 // writable directory caches, since writable directory caches are typically the
 // result of a compilation, which is slow, whereas downloading files is
 // relatively quick in comparison.
-func garbageCollection() error {
-	// Hold lock during entire garbage collection to protect cache map modifications
-	// during Evict() calls from runGarbageCollection()
+func garbageCollection(tasksRunning bool) error {
+	// Collect eviction candidates under the lock, then release it before
+	// running potentially slow docker commands (#7).
+	cacheMutex.Lock()
+	fileResources := fileCaches.SortedResources()
+	cacheMutex.Unlock()
+
+	err := runGarbageCollection(fileResources, tasksRunning)
+	if err != nil {
+		return err
+	}
+
 	cacheMutex.Lock()
 	defer cacheMutex.Unlock()
-	r := fileCaches.SortedResources()
-	r = append(r, directoryCaches.SortedResources()...)
-	return runGarbageCollection(r)
+
+	currentFreeSpace, err := freeDiskSpaceBytes(config.TasksDir)
+	if err != nil {
+		return fmt.Errorf("could not calculate free disk space in dir %v due to error %#v", config.TasksDir, err)
+	}
+	if currentFreeSpace >= requiredSpaceBytes() {
+		trimPoolExcess()
+		return nil
+	}
+
+	// SortedResources only returns available (not in-use) entries
+	dirResources := directoryCaches.SortedResources()
+	for _, res := range dirResources {
+		cache := res.(*Cache)
+		evictErr := cache.Evict(nil)
+		if evictErr != nil {
+			return evictErr
+		}
+
+		currentFreeSpace, err = freeDiskSpaceBytes(config.TasksDir)
+		if err != nil {
+			return fmt.Errorf("could not calculate free disk space in dir %v due to error %#v", config.TasksDir, err)
+		}
+		if currentFreeSpace >= requiredSpaceBytes() {
+			return nil
+		}
+	}
+
+	if currentFreeSpace < requiredSpaceBytes() {
+		return fmt.Errorf("not able to free up enough disk space - require %v bytes, but only have %v bytes - and nothing left to delete", requiredSpaceBytes(), currentFreeSpace)
+	}
+	return nil
 }
 
 // called when a task starts
@@ -478,9 +661,11 @@ func (taskMount *TaskMount) Stop(err *ExecutionErrors) {
 		if purgeCaches {
 			switch cache := mount.(type) {
 			case *WritableDirectoryCache:
-				cacheMutex.Lock()
-				err.add(Failure(directoryCaches[cache.CacheName].Evict(taskMount)))
-				cacheMutex.Unlock()
+				if entry, ok := taskMount.poolEntries[cache]; ok {
+					cacheMutex.Lock()
+					err.add(Failure(entry.Evict(taskMount)))
+					cacheMutex.Unlock()
+				}
 				continue
 			}
 		}
@@ -561,94 +746,69 @@ func (f *FileMount) FSContent() (FSContent, error) {
 
 func (w *WritableDirectoryCache) Mount(taskMount *TaskMount) error {
 	target := fileutil.AbsFrom(taskMount.task.TaskDir(), w.Directory)
+
 	cacheMutex.Lock()
-	cache, dirCacheExists := directoryCaches[w.CacheName]
+	entry := AcquireCache(w.CacheName)
 
-	// Verify the physical directory still exists on disk. With capacity > 1,
-	// when a new cache is first registered by one task, its Location directory
-	// may not yet exist on disk (it is populated when that task's Unmount
-	// promotes its copy into place). A concurrent task mounting the same cache
-	// would find the entry in the map but no directory to copy from. The
-	// directory can also go missing if the worker crashed between RemoveAll
-	// and the JSON persist in Unmount. In either case, treat the cache as new
-	// so the task gets a fresh empty directory instead of failing.
-	if dirCacheExists {
-		if _, statErr := os.Stat(cache.Location); os.IsNotExist(statErr) {
-			taskMount.Warnf("Writable directory cache '%v' references %v which does not exist on disk; recreating", w.CacheName, cache.Location)
-			delete(directoryCaches, w.CacheName)
-			dirCacheExists = false
-		}
-	}
+	if entry != nil {
+		cacheLocation := entry.Location
+		cacheMutex.Unlock()
 
-	if dirCacheExists {
-		cache.Hits++
-	} else {
-		// new cache, let's initialise it...
-		basename := slugid.Nice()
-		file := filepath.Join(config.CachesDir, basename)
-		taskMount.Infof("No existing writable directory cache '%v' - creating %v", w.CacheName, file)
-		currentUser, err := user.Current()
-		if err != nil {
-			panic(fmt.Errorf("[mounts] Not able to look up UID for current user: %w", err))
-		}
-		cache = &Cache{
-			Hits:          1,
-			Created:       time.Now(),
-			Location:      file,
-			Owner:         directoryCaches,
-			Key:           w.CacheName,
-			OwnerUsername: currentUser.Username,
-			OwnerUID:      currentUser.Uid,
-			Generation:    0,
-		}
-		directoryCaches[w.CacheName] = cache
-	}
-
-	baseGeneration := cache.Generation
-	cacheLocation := cache.Location
-	cacheMutex.Unlock()
-
-	taskMount.cacheStates[w] = cacheMountState{baseGeneration: baseGeneration}
-
-	// Populate the target directory:
-	//  - Existing cache, capacity=1:  rename (fast, O(1) on same FS)
-	//  - Existing cache, capacity>1:  copy with per-cache read lock
-	//  - New cache with content:      extract preloaded content
-	//  - New empty cache:             create empty directory
-	if dirCacheExists && config.Capacity == 1 {
 		parentDir := filepath.Dir(target)
 		taskMount.Infof("Moving existing writable directory cache %v from %v to %v", w.CacheName, cacheLocation, target)
 		if err := MkdirAll(taskMount, parentDir); err != nil {
+			// MkdirAll failed — release the acquired entry back to the pool
+			cacheMutex.Lock()
+			ReleaseCache(entry)
+			cacheMutex.Unlock()
 			return fmt.Errorf("not able to create directory %v: %v", parentDir, err)
 		}
 		if err := RenameCrossDevice(cacheLocation, target); err != nil {
+			// Rename failed — evict the broken entry from the pool
+			cacheMutex.Lock()
+			evictErr := entry.Evict(taskMount)
+			cacheMutex.Unlock()
+			if evictErr != nil {
+				panic(evictErr)
+			}
 			return fmt.Errorf("not able to move directory %v to %v: %v", cacheLocation, target, err)
 		}
-	} else if dirCacheExists {
-		parentDir := filepath.Dir(target)
-		taskMount.Infof("Copying writable directory cache %v from %v to %v", w.CacheName, cacheLocation, target)
-		if err := MkdirAll(taskMount, parentDir); err != nil {
-			return fmt.Errorf("not able to create directory %v: %v", parentDir, err)
-		}
-		rw := getCacheRWLock(w.CacheName)
-		rw.RLock()
-		copyErr := fileutil.CopyDir(cacheLocation, target)
-		rw.RUnlock()
-		if copyErr != nil {
-			return fmt.Errorf("not able to copy directory %v to %v: %v", cacheLocation, target, copyErr)
-		}
-	} else if w.Content != nil {
-		c, err := FSContentFrom(w.Content)
-		if err != nil {
-			return fmt.Errorf("not able to retrieve FSContent: %v", err)
-		}
-		if err = extract(c, w.Format, target, taskMount); err != nil {
-			return err
-		}
+		taskMount.poolEntries[w] = entry
 	} else {
-		if err := MkdirAll(taskMount, target); err != nil {
-			return fmt.Errorf("not able to create directory %v: %v", target, err)
+		// No available pool entry — create a new one
+		var poolErr error
+		entry, poolErr = newPoolEntry(w.CacheName)
+		if poolErr != nil {
+			cacheMutex.Unlock()
+			return poolErr
 		}
+		taskMount.Infof("No existing writable directory cache '%v' - creating %v", w.CacheName, entry.Location)
+		directoryCaches[w.CacheName] = append(directoryCaches[w.CacheName], entry)
+		cacheMutex.Unlock()
+
+		if w.Content != nil {
+			c, err := FSContentFrom(w.Content)
+			if err != nil {
+				cacheMutex.Lock()
+				_ = entry.Evict(taskMount)
+				cacheMutex.Unlock()
+				return fmt.Errorf("not able to retrieve FSContent: %v", err)
+			}
+			if err = extract(c, w.Format, target, taskMount); err != nil {
+				cacheMutex.Lock()
+				_ = entry.Evict(taskMount)
+				cacheMutex.Unlock()
+				return err
+			}
+		} else {
+			if err := MkdirAll(taskMount, target); err != nil {
+				cacheMutex.Lock()
+				_ = entry.Evict(taskMount)
+				cacheMutex.Unlock()
+				return fmt.Errorf("not able to create directory %v: %v", target, err)
+			}
+		}
+		taskMount.poolEntries[w] = entry
 	}
 
 	// Regardless of whether we are running as current user, grant task
@@ -658,6 +818,10 @@ func (w *WritableDirectoryCache) Mount(taskMount *TaskMount) error {
 	// execute as LocalSystem.
 	err := makeDirReadWritableForTaskUser(taskMount, target)
 	if err != nil {
+		cacheMutex.Lock()
+		_ = entry.Evict(taskMount)
+		cacheMutex.Unlock()
+		delete(taskMount.poolEntries, w)
 		return err
 	}
 	taskMount.Infof("Successfully mounted writable directory cache '%v'", target)
@@ -666,56 +830,35 @@ func (w *WritableDirectoryCache) Mount(taskMount *TaskMount) error {
 
 func (w *WritableDirectoryCache) Unmount(taskMount *TaskMount) error {
 	taskCacheDir := fileutil.AbsFrom(taskMount.task.TaskDir(), w.Directory)
-	state, ok := taskMount.cacheStates[w]
+	entry, ok := taskMount.poolEntries[w]
 	if !ok {
-		return Failure(fmt.Errorf("could not persist cache %q due to missing mount state", w.CacheName))
+		return Failure(fmt.Errorf("could not persist cache %q due to missing pool entry", w.CacheName))
 	}
 
-	rw := getCacheRWLock(w.CacheName)
-	if !rw.TryLock() {
-		taskMount.Warnf("Cache %q busy; skipping promotion", w.CacheName)
-		return nil
-	}
-	defer rw.Unlock()
-
-	cacheMutex.RLock()
-	cache := directoryCaches[w.CacheName]
-	cacheMutex.RUnlock()
-	if cache == nil {
-		return Failure(fmt.Errorf("could not persist cache %q due to missing cache entry", w.CacheName))
-	}
-
-	if cache.Generation != state.baseGeneration {
-		taskMount.Warnf("Cache %q changed (generation %d -> %d); skipping promotion", w.CacheName, state.baseGeneration, cache.Generation)
-		return nil
-	}
-
-	cacheDir := cache.Location
+	cacheDir := entry.Location
 	taskMount.Infof("Preserving cache: Moving %q to %q", taskCacheDir, cacheDir)
-	// Remove the old authoritative cache (may be empty if capacity=1 renamed
-	// it into the task dir, or may contain the original content if capacity>1
-	// copied it). Then rename the task's version into place.
+
+	// Clean up any stale directory at entry.Location. Normally this path
+	// should not exist (it was renamed away during Mount), but if
+	// RenameCrossDevice fell back to copy+delete on a cross-device mount,
+	// an incomplete cleanup could leave remnants.
 	if err := os.RemoveAll(cacheDir); err != nil {
-		return Failure(fmt.Errorf("could not persist cache %q due to %v", cache.Key, err))
+		taskMount.Warnf("Could not remove stale cache dir %q: %v", cacheDir, err)
 	}
+
 	if err := RenameCrossDevice(taskCacheDir, cacheDir); err != nil {
-		// Both old and new cache content are now lost. Evict the cache
-		// entry so it gets recreated fresh on the next mount.
+		// Rename failed — evict the entry
 		cacheMutex.Lock()
-		evictErr := cache.Evict(taskMount)
+		evictErr := entry.Evict(taskMount)
 		cacheMutex.Unlock()
 		if evictErr != nil {
 			panic(evictErr)
 		}
-		// If taskCacheDir is a relative path inside the task directory,
-		// it will be cleaned up when the task folder is deleted. If it
-		// is an absolute path outside the task directory, the orphaned
-		// directory will remain until the machine is reimaged.
-		return Failure(fmt.Errorf("could not persist cache %q due to %v", cache.Key, err))
+		return Failure(fmt.Errorf("could not persist cache %q due to %v", w.CacheName, err))
 	}
 
 	cacheMutex.Lock()
-	cache.Generation++
+	ReleaseCache(entry)
 	cacheMutex.Unlock()
 	return nil
 }
@@ -753,17 +896,10 @@ func (f *FileMount) Mount(taskMount *TaskMount) error {
 	// content is cached and pass the cache info to the handler instead of
 	// copying the file to the task directory.
 	if handler, ok := taskMount.task.FileMountHandlers[f.File]; ok {
-		cachedFile, err := ensureCached(fsContent, taskMount)
+		cachedFile, sha256, err := ensureCached(fsContent, taskMount)
 		if err != nil {
 			return err
 		}
-
-		cacheKey, err := fsContent.UniqueKey(taskMount)
-		if err != nil {
-			return err
-		}
-
-		sha256 := fileCaches[cacheKey].SHA256
 		taskMount.Infof("File mount %q handled by registered handler (cache: %v, SHA256: %v)", f.File, cachedFile, sha256)
 		return handler(cachedFile, sha256)
 	}
@@ -782,12 +918,11 @@ func (f *FileMount) Unmount(taskMount *TaskMount) error {
 }
 
 // ensureCached returns a file containing the given content
-func ensureCached(fsContent FSContent, taskMount *TaskMount) (file string, err error) {
+func ensureCached(fsContent FSContent, taskMount *TaskMount) (file string, sha256 string, err error) {
 	cacheKey, err := fsContent.UniqueKey(taskMount)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	var sha256 string
 	requiredSHA256 := fsContent.RequiredSHA256()
 	cacheMutex.Lock()
 	cachedEntry, inCache := fileCaches[cacheKey]
@@ -819,29 +954,57 @@ func ensureCached(fsContent FSContent, taskMount *TaskMount) (file string, err e
 		}
 		taskMount.Infof("Found existing download of %v (%v) with SHA256 %v but task definition explicitly requires %v so deleting it", cacheKey, file, sha256, requiredSHA256)
 		cacheMutex.Lock()
-		err = fileCaches[cacheKey].Evict(taskMount)
-		cacheMutex.Unlock()
-		if err != nil {
-			panic(fmt.Errorf("could not delete cache entry %v: %v", fileCaches[cacheKey], err))
+		if entry, ok := fileCaches[cacheKey]; ok {
+			err = entry.Evict(taskMount)
+			cacheMutex.Unlock()
+			if err != nil {
+				panic(fmt.Errorf("could not delete cache entry %v: %v", entry, err))
+			}
+		} else {
+			cacheMutex.Unlock()
 		}
 	} else {
 		cacheMutex.Unlock()
 	}
-	file, sha256, err = fsContent.Download(taskMount)
-	if err != nil {
+
+	type downloadResult struct {
+		file   string
+		sha256 string
+	}
+	val, dlErr, _ := fileCacheDownloads.Do(cacheKey, func() (any, error) {
+		// Re-check cache: another goroutine may have completed the download
+		// while we were waiting for the singleflight lock.
+		cacheMutex.Lock()
+		if entry, ok := fileCaches[cacheKey]; ok {
+			cacheMutex.Unlock()
+			return downloadResult{file: entry.Location, sha256: entry.SHA256}, nil
+		}
+		cacheMutex.Unlock()
+
+		f, s, err := fsContent.Download(taskMount)
+		if err != nil {
+			return nil, err
+		}
+		cacheMutex.Lock()
+		fileCaches[cacheKey] = &Cache{
+			Location: f,
+			Hits:     1,
+			Created:  time.Now(),
+			Owner:    fileCaches,
+			Key:      cacheKey,
+			SHA256:   s,
+		}
+		cacheMutex.Unlock()
+		return downloadResult{file: f, sha256: s}, nil
+	})
+	if dlErr != nil {
+		err = dlErr
 		taskMount.Errorf("Could not fetch from %v into file %v due to %v", fsContent, file, err)
 		return
 	}
-	cacheMutex.Lock()
-	fileCaches[cacheKey] = &Cache{
-		Location: file,
-		Hits:     1,
-		Created:  time.Now(),
-		Owner:    fileCaches,
-		Key:      cacheKey,
-		SHA256:   sha256,
-	}
-	cacheMutex.Unlock()
+	dl := val.(downloadResult)
+	file = dl.file
+	sha256 = dl.sha256
 	if requiredSHA256 == "" {
 		taskMount.Warnf("Download %v of %v has SHA256 %v but task payload does not declare a required value, so content authenticity cannot be verified", file, fsContent, sha256)
 		return
@@ -849,10 +1012,14 @@ func ensureCached(fsContent FSContent, taskMount *TaskMount) (file string, err e
 	if requiredSHA256 != sha256 {
 		err = fmt.Errorf("Download %v of %v has SHA256 %v but task definition explicitly requires %v; not retrying download as there were no connection failures and HTTP response status code was 200", file, fsContent, sha256, requiredSHA256)
 		cacheMutex.Lock()
-		err2 := fileCaches[cacheKey].Evict(taskMount)
-		cacheMutex.Unlock()
-		if err2 != nil {
-			panic(fmt.Errorf("could not delete cache entry %v: %v", fileCaches[cacheKey], err2))
+		if entry, ok := fileCaches[cacheKey]; ok {
+			err2 := entry.Evict(taskMount)
+			cacheMutex.Unlock()
+			if err2 != nil {
+				panic(fmt.Errorf("could not delete cache entry %v: %v", entry, err2))
+			}
+		} else {
+			cacheMutex.Unlock()
 		}
 		return
 	}
@@ -862,7 +1029,7 @@ func ensureCached(fsContent FSContent, taskMount *TaskMount) (file string, err e
 
 func extract(fsContent FSContent, format string, dir string, taskMount *TaskMount) (err error) {
 	var cacheFile string
-	cacheFile, err = ensureCached(fsContent, taskMount)
+	cacheFile, _, err = ensureCached(fsContent, taskMount)
 	if err != nil {
 		log.Printf("Could not cache content: %v", err)
 		return
@@ -895,7 +1062,7 @@ func extract(fsContent FSContent, format string, dir string, taskMount *TaskMoun
 }
 
 func decompress(fsContent FSContent, format string, file string, taskMount *TaskMount) error {
-	cacheFile, err := ensureCached(fsContent, taskMount)
+	cacheFile, _, err := ensureCached(fsContent, taskMount)
 	if err != nil {
 		log.Printf("Could not cache content: %v", err)
 		return err
@@ -1245,9 +1412,9 @@ func (taskMount *TaskMount) purgeCaches() error {
 		}
 	}
 	// Round(0) forces wall time calculation instead of monotonic time in case machine slept etc
-	cacheMutex.RLock()
+	cacheMutex.Lock()
 	lastQueried := lastQueriedPurgeCacheService
-	cacheMutex.RUnlock()
+	cacheMutex.Unlock()
 	if len(writableCaches) == 0 && time.Now().Round(0).Sub(lastQueried) < 6*time.Hour {
 		return nil
 	}
@@ -1277,13 +1444,35 @@ func (taskMount *TaskMount) purgeCaches() error {
 	cacheMutex.Lock()
 	defer cacheMutex.Unlock()
 	for _, request := range purgeRequests.Requests {
-		if cache, exists := directoryCaches[request.CacheName]; exists {
+		entries, exists := directoryCaches[request.CacheName]
+		if !exists {
+			continue
+		}
+		// Evict available entries that are older than the purge request.
+		// In-use entries that match are marked for deferred eviction
+		// so they don't return to the pool with stale content.
+		remaining := entries[:0]
+		for _, cache := range entries {
 			if cache.Created.Add(-5 * time.Minute).Before(time.Time(request.Before)) {
-				err := cache.Evict(taskMount)
-				if err != nil {
-					panic(err)
+				if cache.InUse {
+					taskMount.Infof("Marking in-use cache %v for deferred purge", cache.Key)
+					cache.NeedsPurge = true
+					remaining = append(remaining, cache)
+					continue
 				}
+				taskMount.Infof("Removing cache %v from cache table (purge request)", cache.Key)
+				taskMount.Infof("Deleting cache %v file(s) at %v", cache.Key, cache.Location)
+				if err := os.RemoveAll(cache.Location); err != nil {
+					return err
+				}
+			} else {
+				remaining = append(remaining, cache)
 			}
+		}
+		if len(remaining) == 0 {
+			delete(directoryCaches, request.CacheName)
+		} else {
+			directoryCaches[request.CacheName] = remaining
 		}
 	}
 	return nil
