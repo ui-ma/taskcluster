@@ -2308,6 +2308,50 @@ type QueueCreateTaskDeprecatedFn = {
   extra: JsonB;
  }): Promise<void>;
 };
+type QueueCreateTaskAtomicFn = {
+ (
+   task_id: string,
+   task_queue_id: string,
+   scheduler_id: string,
+   project_id: string,
+   task_group_id: string,
+   dependencies: JsonB,
+   requires: TaskRequires,
+   routes: JsonB,
+   priority: TaskPriority,
+   retries: number,
+   created: Date,
+   deadline: Date,
+   expires: Date,
+   scopes: JsonB,
+   payload: JsonB,
+   metadata: JsonB,
+   tags: JsonB,
+   extra: JsonB,
+   deadline_delay_seconds_in: number
+ ): Promise<void>;
+ (params: {
+  task_id: string;
+  task_queue_id: string;
+  scheduler_id: string;
+  project_id: string;
+  task_group_id: string;
+  dependencies: JsonB;
+  requires: TaskRequires;
+  routes: JsonB;
+  priority: TaskPriority;
+  retries: number;
+  created: Date;
+  deadline: Date;
+  expires: Date;
+  scopes: JsonB;
+  payload: JsonB;
+  metadata: JsonB;
+  tags: JsonB;
+  extra: JsonB;
+  deadline_delay_seconds_in: number;
+ }): Promise<void>;
+};
 type QueueCreateTaskProjidFn = {
  (
    task_id: string,
@@ -3224,6 +3268,22 @@ type QueueQueuePendingTasksAddFn = {
   run_id_in: number;
   hint_id_in: string;
   expires_in: any;
+ }): Promise<void>;
+};
+type QueueQueuePendingTasksAddForTaskFn = {
+ (
+   task_queue_id_in: string,
+   priority_in: TaskPriority,
+   deadline_in: Date,
+   task_id_in: string,
+   run_id_in: number
+ ): Promise<void>;
+ (params: {
+  task_queue_id_in: string;
+  priority_in: TaskPriority;
+  deadline_in: Date;
+  task_id_in: string;
+  run_id_in: number;
  }): Promise<void>;
 };
 type QueueQueuePendingTasksCountFn = {
@@ -6301,6 +6361,7 @@ export interface DbFunctions {
   check_task_claim: QueueCheckTaskClaimFn;
   claim_task: QueueClaimTaskFn;
   create_queue_artifact_2: QueueCreateQueueArtifact2Fn;
+  create_task_atomic: QueueCreateTaskAtomicFn;
   create_task_projid: QueueCreateTaskProjidFn;
   delete_queue_artifact: QueueDeleteQueueArtifactFn;
   delete_queue_artifacts: QueueDeleteQueueArtifactsFn;
@@ -6341,6 +6402,7 @@ export interface DbFunctions {
   queue_claimed_tasks_count: QueueQueueClaimedTasksCountFn;
   queue_pending_task_delete: QueueQueuePendingTaskDeleteFn;
   queue_pending_tasks_add: QueueQueuePendingTasksAddFn;
+  queue_pending_tasks_add_for_task: QueueQueuePendingTasksAddForTaskFn;
   queue_pending_tasks_count: QueueQueuePendingTasksCountFn;
   queue_pending_tasks_delete: QueueQueuePendingTasksDeleteFn;
   queue_pending_tasks_delete_expired: QueueQueuePendingTasksDeleteExpiredFn;

@@ -416,6 +416,7 @@ suite(testing.suiteName(), function() {
         await client.query('truncate tasks');
         await client.query('truncate task_groups');
         await client.query('truncate task_dependencies');
+        await client.query('truncate queue_pending_tasks');
       });
     });
 
@@ -879,6 +880,23 @@ suite(testing.suiteName(), function() {
         const task = fixRuns(await db.fns.get_task_projid(taskId));
         assert.deepEqual(task[0].runs, res[0].runs);
       });
+
+      helper.dbTest('also inserts queue_pending_tasks row', async function(db) {
+        await create(db);
+        await db.fns.schedule_task(taskId, 'scheduled');
+
+        const rows = await helper.withDbClient(async client => {
+          const { rows } = await client.query(
+            'select task_queue_id, priority, run_id from queue_pending_tasks where task_id = $1',
+            [taskId],
+          );
+          return rows;
+        });
+        assert.equal(rows.length, 1, 'schedule_task must atomically insert into queue_pending_tasks');
+        assert.equal(rows[0].task_queue_id, 'prov/wt');
+        assert.equal(rows[0].priority, 5);
+        assert.equal(rows[0].run_id, 0);
+      });
     });
 
     suite('rerun_task', function() {
@@ -945,6 +963,24 @@ suite(testing.suiteName(), function() {
         }]);
         const task = fixRuns(await db.fns.get_task_projid(taskId));
         assert.deepEqual(task[0].runs, res[0].runs);
+      });
+
+      helper.dbTest('also inserts queue_pending_tasks row for the new run', async function(db) {
+        await create(db);
+        await setTaskRuns(db, [{ state: 'exception', reasonCreated: 'scheduled', reasonResolved: 'failed' }]);
+        await db.fns.rerun_task(taskId);
+
+        const rows = await helper.withDbClient(async client => {
+          const { rows } = await client.query(
+            'select task_queue_id, priority, run_id from queue_pending_tasks where task_id = $1',
+            [taskId],
+          );
+          return rows;
+        });
+        assert.equal(rows.length, 1, 'rerun_task must atomically insert into queue_pending_tasks');
+        assert.equal(rows[0].task_queue_id, 'prov/wt');
+        assert.equal(rows[0].priority, 5);
+        assert.equal(rows[0].run_id, 1);
       });
     });
 
@@ -1290,6 +1326,55 @@ suite(testing.suiteName(), function() {
         assert.deepEqual(task[0].runs, res[0].runs);
         assert.deepEqual(task[0].taken_until, res[0].taken_until);
       });
+
+      helper.dbTest('resolve with retry inserts queue_pending_tasks row for the retry run', async function(db) {
+        await create(db);
+        await setTaskRuns(db, [{ state: 'running' }]);
+        await db.fns.resolve_task(taskId, 0, 'exception', 'worker-shutdown', 'retry');
+
+        const rows = await helper.withDbClient(async client => {
+          const { rows } = await client.query(
+            'select run_id from queue_pending_tasks where task_id = $1',
+            [taskId],
+          );
+          return rows;
+        });
+        assert.equal(rows.length, 1, 'resolve_task with retry must enqueue the retry run');
+        assert.equal(rows[0].run_id, 1);
+      });
+
+      helper.dbTest('resolve without retry does not insert queue_pending_tasks row', async function(db) {
+        await create(db);
+        await setTaskRuns(db, [{ state: 'running' }]);
+        await db.fns.resolve_task(taskId, 0, 'exception', 'worker-shutdown', null);
+
+        const count = await helper.withDbClient(async client => {
+          const { rows } = await client.query(
+            'select count(*)::int as c from queue_pending_tasks where task_id = $1',
+            [taskId],
+          );
+          return rows[0].c;
+        });
+        assert.equal(count, 0);
+      });
+
+      helper.dbTest('resolve with retry_reason but retries_left=0 does not insert', async function(db) {
+        await create(db);
+        await setTaskRuns(db, [{ state: 'running' }]);
+        await helper.withDbClient(async client => {
+          await client.query('update tasks set retries_left = 0 where task_id = $1', [taskId]);
+        });
+        await db.fns.resolve_task(taskId, 0, 'exception', 'worker-shutdown', 'retry');
+
+        const count = await helper.withDbClient(async client => {
+          const { rows } = await client.query(
+            'select count(*)::int as c from queue_pending_tasks where task_id = $1',
+            [taskId],
+          );
+          return rows[0].c;
+        });
+        assert.equal(count, 0);
+      });
     });
 
     suite('check_task_claim', function() {
@@ -1415,6 +1500,47 @@ suite(testing.suiteName(), function() {
         const task = fixRuns(await db.fns.get_task_projid(taskId));
         assert.deepEqual(task[0].runs, res[0].runs);
         assert.deepEqual(task[0].taken_until, res[0].taken_until);
+      });
+
+      helper.dbTest('claim-expired with retry inserts queue_pending_tasks row', async function(db) {
+        await create(db);
+        const takenUntil = new Date(Date.now() + 60_000);
+        await setTaskRuns(db, [{ state: 'running', takenUntil: takenUntil.toISOString() }]);
+        await helper.withDbClient(async client => {
+          await client.query('update tasks set taken_until = $1 where task_id = $2', [takenUntil, taskId]);
+        });
+
+        await db.fns.check_task_claim(taskId, 0, takenUntil);
+
+        const rows = await helper.withDbClient(async client => {
+          const { rows } = await client.query(
+            'select run_id from queue_pending_tasks where task_id = $1',
+            [taskId],
+          );
+          return rows;
+        });
+        assert.equal(rows.length, 1, 'check_task_claim must enqueue the retry run');
+        assert.equal(rows[0].run_id, 1);
+      });
+
+      helper.dbTest('claim-expired with retries_left=0 does not insert', async function(db) {
+        await create(db);
+        const takenUntil = new Date(Date.now() + 60_000);
+        await setTaskRuns(db, [{ state: 'running', takenUntil: takenUntil.toISOString() }]);
+        await helper.withDbClient(async client => {
+          await client.query('update tasks set taken_until = $1, retries_left = 0 where task_id = $2', [takenUntil, taskId]);
+        });
+
+        await db.fns.check_task_claim(taskId, 0, takenUntil);
+
+        const count = await helper.withDbClient(async client => {
+          const { rows } = await client.query(
+            'select count(*)::int as c from queue_pending_tasks where task_id = $1',
+            [taskId],
+          );
+          return rows[0].c;
+        });
+        assert.equal(count, 0);
       });
     });
 
@@ -2461,6 +2587,56 @@ suite(testing.suiteName(), function() {
       const second = await db.fns.queue_change_task_priority(id, 'medium');
       assert.equal(second.length, 1);
       assert.equal(second[0].old_priority, 'highest');
+    });
+  });
+
+  suite('queue_pending_tasks_add_for_task', function() {
+    setup('reset tables', async function() {
+      await helper.withDbClient(async client => {
+        await client.query('truncate queue_pending_tasks');
+        await client.query('truncate tasks');
+        await client.query('truncate task_groups');
+        await client.query('truncate task_dependencies');
+      });
+    });
+
+    helper.dbTest('inserts a queue_pending_tasks row matching task metadata', async function(db) {
+      await create(db);
+      await setTaskRuns(db, [{ state: 'pending', reasonCreated: 'scheduled', scheduled: new Date().toISOString() }]);
+
+      await db.fns.queue_pending_tasks_add_for_task('prov/wt', 'high', deadline, taskId, 0);
+
+      const rows = await helper.withDbClient(async client => {
+        const { rows } = await client.query(
+          'select task_queue_id, priority, task_id, run_id, hint_id, expires from queue_pending_tasks where task_id = $1 and run_id = $2',
+          [taskId, 0],
+        );
+        return rows;
+      });
+      assert.equal(rows.length, 1);
+      assert.equal(rows[0].task_queue_id, 'prov/wt');
+      assert.equal(rows[0].priority, 5);
+      assert.equal(rows[0].task_id, taskId);
+      assert.equal(rows[0].run_id, 0);
+      assert.ok(rows[0].hint_id);
+      assert.ok(rows[0].expires instanceof Date);
+    });
+
+    helper.dbTest('is idempotent on repeated calls (ON CONFLICT DO UPDATE)', async function(db) {
+      await create(db);
+      await setTaskRuns(db, [{ state: 'pending', reasonCreated: 'scheduled', scheduled: new Date().toISOString() }]);
+
+      await db.fns.queue_pending_tasks_add_for_task('prov/wt', 'high', deadline, taskId, 0);
+      await db.fns.queue_pending_tasks_add_for_task('prov/wt', 'high', deadline, taskId, 0);
+
+      const count = await helper.withDbClient(async client => {
+        const { rows } = await client.query(
+          'select count(*)::int as c from queue_pending_tasks where task_id = $1 and run_id = $2',
+          [taskId, 0],
+        );
+        return rows[0].c;
+      });
+      assert.equal(count, 1);
     });
   });
 });
