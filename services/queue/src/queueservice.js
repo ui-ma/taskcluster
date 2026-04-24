@@ -14,7 +14,11 @@ let secondsTo = (target, relativeTo = new Date()) => {
   return Math.max(delta, 1);
 };
 
-/** Priority to constant number */
+/** Priority to constant number.
+ *
+ * This mapping is duplicated in the SQL `CASE` expression inside the
+ * `queue_pending_tasks_add_for_task` helper in `db/versions/0124.yml`.
+ * If you add or reorder priority tiers, update both. */
 const PRIORITY_TO_CONSTANT = {
   highest: 7,
   'very-high': 6,
@@ -269,7 +273,15 @@ export class QueueService {
   }
 
   /**
-   * Enqueue message about a new pending task in appropriate queue
+   * Enqueue message about a new pending task in appropriate queue.
+   *
+   * As of db v124 the production code paths that transition a run to
+   * `pending` enqueue atomically inside the DB fn itself (see
+   * `queue_pending_tasks_add_for_task` in `db/versions/0124.yml`). This
+   * method is retained for test setup in
+   * `services/queue/test/queueservice_test.js`, which pre-populates
+   * `queue_pending_tasks` without going through a real task state
+   * transition.
    *
    * The `task` argument is an object with the properties:
    *  - `taskId`

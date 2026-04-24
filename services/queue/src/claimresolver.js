@@ -145,14 +145,23 @@ class ClaimResolver {
 
     let status = task.status();
 
-    // Publish message about task exception
-    await this.publisher.taskException({
-      status: status,
-      runId: runId,
-      task: { tags: task.tags || {} },
-      workerGroup: run.workerGroup,
-      workerId: run.workerId,
-    }, task.routes);
+    // Publish message about task exception. check_task_claim has already
+    // committed atomically with queue_pending_tasks for any retry, so publish
+    // best-effort.
+    try {
+      await this.publisher.taskException({
+        status: status,
+        runId: runId,
+        task: { tags: task.tags || {} },
+        workerGroup: run.workerGroup,
+        workerId: run.workerId,
+      }, task.routes);
+    } catch (err) {
+      this.monitor.reportError(err, 'warning', {
+        message: 'task-exception Pulse publish failed; DB is already consistent (db v124)',
+        taskId, runId,
+      });
+    }
     this.monitor.log.taskException({ taskId, runId });
 
     const metricLabels = splitTaskQueueId(task.taskQueueId);
@@ -168,14 +177,20 @@ class ClaimResolver {
         task.runs.length - 1 === runId + 1 &&
         newRun.state === 'pending' &&
         newRun.reasonCreated === 'retry') {
-      await Promise.all([
-        this.queueService.putPendingMessage(task, runId + 1),
-        this.publisher.taskPending({
+      // queue_pending_tasks insert is now atomic inside check_task_claim
+      // (db v124). Publish best-effort.
+      try {
+        await this.publisher.taskPending({
           status: status,
           runId: runId + 1,
           task: { tags: task.tags || {} },
-        }, task.routes),
-      ]);
+        }, task.routes);
+      } catch (err) {
+        this.monitor.reportError(err, 'warning', {
+          message: 'task-pending Pulse publish failed for retry run; queue_pending_tasks row is already committed (db v124)',
+          taskId, runId: runId + 1,
+        });
+      }
       this.monitor.log.taskPending({ taskId, runId: runId + 1 });
     } else {
       // Update dependencyTracker

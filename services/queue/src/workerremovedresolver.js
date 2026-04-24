@@ -20,7 +20,6 @@ class WorkerRemovedResolver {
   constructor(options) {
     assert(options, 'options must be given');
     assert(options.db, 'options must include db');
-    assert(options.queueService, 'Expected a queueService instance');
     assert(options.dependencyTracker, 'Expected a DependencyTracker instance');
     assert(options.publisher, 'Expected a publisher');
     assert(options.pulseClient, 'Expected a pulseClient');
@@ -28,7 +27,6 @@ class WorkerRemovedResolver {
     assert(options.monitor !== null, 'options.monitor required!');
 
     this.db = options.db;
-    this.queueService = options.queueService;
     this.dependencyTracker = options.dependencyTracker;
     this.publisher = options.publisher;
     this.pulseClient = options.pulseClient;
@@ -103,13 +101,22 @@ class WorkerRemovedResolver {
 
     const status = task.status();
 
-    await this.publisher.taskException({
-      status,
-      runId,
-      task: { tags: task.tags || {} },
-      workerGroup: run.workerGroup,
-      workerId: run.workerId,
-    }, task.routes);
+    // Publish task-exception. resolve_task has already committed atomically
+    // with queue_pending_tasks for any retry, so publish best-effort.
+    try {
+      await this.publisher.taskException({
+        status,
+        runId,
+        task: { tags: task.tags || {} },
+        workerGroup: run.workerGroup,
+        workerId: run.workerId,
+      }, task.routes);
+    } catch (err) {
+      this.monitor.reportError(err, 'warning', {
+        message: 'task-exception Pulse publish failed; DB is already consistent (db v124)',
+        taskId, runId,
+      });
+    }
     this.monitor.log.taskException({ taskId, runId });
 
     const metricLabels = splitTaskQueueId(task.taskQueueId);
@@ -124,14 +131,20 @@ class WorkerRemovedResolver {
         task.runs.length - 1 === runId + 1 &&
         newRun.state === 'pending' &&
         newRun.reasonCreated === 'retry') {
-      await Promise.all([
-        this.queueService.putPendingMessage(task, runId + 1),
-        this.publisher.taskPending({
+      // queue_pending_tasks insert is now atomic inside resolve_task (db v124).
+      // Publish best-effort.
+      try {
+        await this.publisher.taskPending({
           status,
           runId: runId + 1,
           task: { tags: task.tags || {} },
-        }, task.routes),
-      ]);
+        }, task.routes);
+      } catch (err) {
+        this.monitor.reportError(err, 'warning', {
+          message: 'task-pending Pulse publish failed for retry run; queue_pending_tasks row is already committed (db v124)',
+          taskId, runId: runId + 1,
+        });
+      }
       this.monitor.log.taskPending({ taskId, runId: runId + 1 });
     } else {
       await this.dependencyTracker.resolveTask(
